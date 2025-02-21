@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+import os
+
+# Set the working directory to the scripts folder
+script_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(script_dir)
+print("Current Working Directory set to:", os.getcwd())
 """
 Combined Refactored Script for EY Open Data Science 2025 Project
 
@@ -33,6 +39,8 @@ import lightgbm as lgb
 # 01 Reading Target Variables
 # ----------------------------------------------------------------------
 def read_target_variables():
+    import os
+    print("Current Working Directory:", os.getcwd())
     print("Reading UHI target variables...")
     file_path = "../input/Training_data_uhi_index.csv"
     df_uhi = pd.read_csv(file_path)
@@ -86,6 +94,7 @@ def process_building_footprints():
     # Select and rename columns to ensure a common join key; assuming the rating is in 'ENERGY_STAR_RATING'
     gdf_energy_star = gdf_energy_star[['NYC Building Identification Number (BIN)', 'ENERGY STAR Score']]
     gdf_energy_star = gdf_energy_star.rename(columns={'NYC Building Identification Number (BIN)': 'bin'})
+    gdf_energy_star['ENERGY STAR Score'] = pd.to_numeric(gdf_energy_star['ENERGY STAR Score'], errors='coerce')
     
     # Ensure the ENERGY STAR dataset is in the same CRS
     # gdf_energy_star = gdf_energy_star.to_crs(epsg=2263)
@@ -274,9 +283,14 @@ def process_weather_data():
     df_bronx["location"] = "Bronx"
     df_manhattan["location"] = "Manhattan"
     df_weather = pd.concat([df_bronx, df_manhattan], ignore_index=True)
+    df_weather['Date / Time'] = pd.to_datetime(df_weather['Date / Time'], errors='coerce')
+    df_weather = pd.get_dummies(df_weather, columns=['location'], prefix='loc', dtype=int)
+    # Clean column names: replace special characters with underscores or remove them
+    df_weather.columns = df_weather.columns.str.replace(r'[\[\]]', '', regex=True)  # Remove brackets
+    df_weather.columns = df_weather.columns.str.replace(' ', '_')  # Replace spaces with underscores
+    df_weather.columns = df_weather.columns.str.replace(r'[^\w]', '', regex=True)  # Remove other special chars
     print("Sample weather data:")
     print(df_weather.head())
-    df_weather['Date / Time'] = pd.to_datetime(df_weather['Date / Time'], errors='coerce')
     output_path = "../output/weather_data_processed.parquet"
     df_weather.to_parquet(output_path, index=False)
     print(f"Weather data saved to: {output_path}")
@@ -291,6 +305,7 @@ def feature_engineering():
     gdf_buildings = gpd.read_parquet("../output/building_data_processed.parquet")
     gdf_ndvi = gpd.read_parquet("../output/sentinel2.parquet")
     gdf_lst = gpd.read_parquet("../output/landsat_lst.parquet")
+    gdf_albedo = gpd.read_parquet("../output/landsat_albedo.parquet")
     df_weather = pd.read_parquet("../output/weather_data_processed.parquet")
     
     # Create a 100-meter buffer around each UHI point
@@ -301,7 +316,8 @@ def feature_engineering():
     agg_buildings = joined.groupby('index_right').agg(
         building_count=('heightroof', 'count'),
         mean_height=('heightroof', 'mean'),
-        total_area=('calculated_area_sqm', 'sum')
+        total_area=('calculated_area_sqm', 'sum'),
+        mean_energy_star=('ENERGY STAR Score', 'mean')
     ).reset_index()
     df_uhi = df_uhi.reset_index().merge(agg_buildings, left_index=True, right_on='index_right', how='left')
     
@@ -316,6 +332,26 @@ def feature_engineering():
         std_ndvi=('NDVI', 'std')
     ).reset_index()
     df_uhi = df_uhi.merge(agg_ndvi, left_on='index', right_on='index_right', how='left')
+
+    # Spatial join with albedo pixels and aggregate albedo features
+    joined_albedo = gpd.sjoin(gdf_albedo, df_uhi.set_geometry('buffer'), how='inner', predicate='intersects')
+    print("Columns in joined_albedo:", joined_albedo.columns.tolist())
+    print("Sample of joined_albedo:", joined_albedo.head())
+    print("gdf_albedo CRS:", gdf_albedo.crs)
+    print("df_uhi CRS:", df_uhi.crs)
+    print("Number of rows in joined_albedo:", len(joined_albedo))
+    agg_albedo = joined_albedo.groupby('index_right0').agg(
+        mean_albedo=('Albedo', 'mean'),
+        min_albedo=('Albedo', 'min'),
+        max_albedo=('Albedo', 'max')
+    ).reset_index()
+    df_uhi = df_uhi.merge(agg_albedo, left_on='index', right_on='index_right0', how='left')
+
+    # Integrate weather data by matching closest timestamp
+    df_uhi['weather_time'] = df_uhi['datetime'].apply(
+        lambda x: df_weather.iloc[(df_weather['Date__Time'] - x).abs().argsort()[0]]['Date__Time']
+    )
+    df_uhi = df_uhi.merge(df_weather, left_on='weather_time', right_on='Date__Time', how='left')
     
     print("Feature engineering completed. Sample features:")
     print(df_uhi.head())
@@ -324,25 +360,32 @@ def feature_engineering():
 # ----------------------------------------------------------------------
 # Additional Preprocessing for Modelling
 # ----------------------------------------------------------------------
-def prepare_features(df_model):
-    """
-    Impute missing building features with 0, impute NDVI columns with their citywide mean,
-    clip NDVI values to [-1, 1], and compute log-transformed features.
-    """
-    df_model['building_count'] = df_model['building_count'].fillna(0)
-    df_model['mean_height'] = df_model['mean_height'].fillna(0)
-    df_model['total_area'] = df_model['total_area'].fillna(0)
-    df_model['building_area_ratio'] = df_model['building_area_ratio'].fillna(0)
+def prepare_features(df_model, df_weather):
+   # Impute missing building-related features with 0
+    for col in ['building_count', 'mean_height', 'total_area', 'building_area_ratio']:
+        df_model[col] = df_model[col].fillna(0)
     
-    ndvi_cols = ['mean_ndvi', 'median_ndvi', 'std_ndvi']
-    for col in ndvi_cols:
+    # Impute missing NDVI and albedo features with their means
+    for col in ['mean_ndvi', 'median_ndvi', 'std_ndvi', 'mean_albedo', 'min_albedo', 'max_albedo', 'mean_energy_star']:
         df_model[col] = df_model[col].fillna(df_model[col].mean())
     
+    # Clip NDVI values to [-1, 1]
     df_model['mean_ndvi'] = df_model['mean_ndvi'].clip(-1, 1)
     df_model['median_ndvi'] = df_model['median_ndvi'].clip(-1, 1)
     
-    df_model['log_total_area'] = np.log1p(df_model['total_area'])
-    df_model['log_building_area_ratio'] = np.log1p(df_model['building_area_ratio'])
+    # Log-transform relevant features
+    for col in ['total_area', 'building_area_ratio']:
+        df_model[f'log_{col}'] = np.log1p(df_model[col])
+    
+    # Handle numeric weather data (exclude location dummies)
+    weather_cols = [col for col in df_model.columns if col in df_weather.columns and col != 'Date__Time' and not col.startswith('loc_')]
+    for col in weather_cols:
+        df_model[col] = df_model[col].fillna(df_model[col].mean())
+    
+    # Handle location dummy variables separately (impute with mode)
+    location_cols = [col for col in df_model.columns if col in ['loc_Bronx', 'loc_Manhattan']]
+    for col in location_cols:
+        df_model[col] = df_model[col].fillna(df_model[col].mode()[0])  # Use most frequent value (0 or 1)
     return df_model
 
 # ----------------------------------------------------------------------
@@ -353,12 +396,24 @@ def run_modelling():
     df_uhi, df_weather = feature_engineering()
     # For modelling, we use the engineered UHI dataframe as our model dataset.
     df_model = df_uhi.copy()
-    df_model = prepare_features(df_model)
+    df_model = prepare_features(df_model, df_weather)
     
     # Define predictor features (exclude non-predictors)
-    features = [col for col in df_model.columns if col not in ['UHI Index', 'datetime', 'Longitude', 'Latitude']]
+    features = [col for col in df_model.columns if col not in ['index', 'geometry', 'buffer', 'index_right_x', 'index_right_y', 'index_right0', 'weather_time', 'Date__Time', 'UHI Index', 'datetime', 'Longitude', 'Latitude']]
     X = df_model[features]
     y = df_model['UHI Index']
+    
+    # ---- New Standardization Code ----
+    # Import StandardScaler to normalize numerical features
+    from sklearn.preprocessing import StandardScaler
+    
+    # Identify numerical features for standardization (excluding categorical or geometry if any)
+    numerical_features = X.select_dtypes(include=['float64', 'int64']).columns.tolist()
+    
+    # Initialize and apply standardization: transform features to have mean=0 and variance=1
+    # This helps LightGBM converge faster and improves performance by reducing scale differences
+    scaler = StandardScaler()
+    X[numerical_features] = scaler.fit_transform(X[numerical_features])
     
     # Split data into training and testing sets (70/30 split)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
