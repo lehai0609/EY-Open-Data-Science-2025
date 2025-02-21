@@ -23,7 +23,7 @@ import geopandas as gpd
 # ----------------------------------------------------------------------
 # 01 Read Target Variables
 # ----------------------------------------------------------------------
-def read_target_variables(filepath="../input/Training_data_uhi_index.csv"):
+def read_target_variables(filepath="input/Training_data_uhi_index.csv"):
     """
     Reads the UHI target variables from a CSV file,
     converts the datetime column, creates a GeoDataFrame, and reprojects it to EPSG:2263.
@@ -42,7 +42,7 @@ def read_target_variables(filepath="../input/Training_data_uhi_index.csv"):
 # ----------------------------------------------------------------------
 # 02 Read Building Footprints
 # ----------------------------------------------------------------------
-def read_building_footprints(filepath="../input/Building Footprints_20250131.geojson"):
+def read_building_footprints(filepath="input/Building Footprints_20250131.geojson"):
     """
     Reads building footprints from a GeoJSON file, converts key columns to numeric,
     applies minimal cleaning, and reprojects to EPSG:2263.
@@ -75,7 +75,7 @@ def read_building_footprints(filepath="../input/Building Footprints_20250131.geo
 # ----------------------------------------------------------------------
 # 03 Read ENERGY STAR Score Data
 # ----------------------------------------------------------------------
-def read_energy_star_data(filepath="../input/NYC_Building_Energy_20250216.csv"):
+def read_energy_star_data(filepath="input/Energy_and_Water_Data_2021.csv"):
     """
     Reads ENERGY STAR score data from a CSV file and prepares it for merging.
     """
@@ -89,7 +89,7 @@ def read_energy_star_data(filepath="../input/NYC_Building_Energy_20250216.csv"):
 # ----------------------------------------------------------------------
 # 04 Read New York Weather Data
 # ----------------------------------------------------------------------
-def read_weather_data(filepath="../input/NY_Mesonet_Weather.xlsx"):
+def read_weather_data(filepath="input/NY_Mesonet_Weather.xlsx"):
     """
     Reads New York weather data from an Excel file (from both Bronx and Manhattan sheets),
     concatenates them, cleans column names, and returns a DataFrame.
