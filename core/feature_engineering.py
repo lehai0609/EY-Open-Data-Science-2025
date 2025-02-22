@@ -50,12 +50,12 @@ def aggregate_ndvi_features(df_uhi, gdf_ndvi):
 def aggregate_albedo_features(df_uhi, gdf_albedo):
     """Joins albedo pixels with buffered UHI and aggregates albedo statistics."""
     joined = gpd.sjoin(gdf_albedo, df_uhi.set_geometry('buffer'), how='inner', predicate='intersects')
-    agg = joined.groupby('index_right0').agg(
+    agg = joined.groupby('index_right').agg(
         mean_albedo=('Albedo', 'mean'),
         min_albedo=('Albedo', 'min'),
         max_albedo=('Albedo', 'max')
     ).reset_index()
-    df_uhi = df_uhi.merge(agg, left_on='index', right_on='index_right0', how='left')
+    df_uhi = df_uhi.merge(agg, left_on='index', right_on='index_right', how='left')
     return df_uhi
 
 def integrate_weather_data(df_uhi, df_weather):
@@ -67,7 +67,42 @@ def integrate_weather_data(df_uhi, df_weather):
     df = df.merge(df_weather, left_on='weather_time', right_on='Date__Time', how='left')
     return df
 
-def feature_engineering(df_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather):
+def aggregate_socioecon_data(df_person):
+    """
+    Aggregates socio-economic data by housing unit (CONTROL code):
+      - Computes average housing income.
+      - Finds the highest tenant education level.
+    Returns a DataFrame keyed by CONTROL.
+    """
+    agg_df = df_person.groupby('CONTROL').agg(
+        avg_income=('TOTAL_INC_REC_P', 'mean'),
+        max_education=('EDATTAIN_P', 'max')
+    ).reset_index()
+    return agg_df
+
+def aggregate_socioecon_features(df_uhi, gdf_buildings):
+    """
+    Joins the updated building dataset (which includes socio-economic features)
+    with df_uhi based on the UHI buffer. Aggregates socio-economic features
+    (e.g., mean income, highest education) into df_uhi.
+    """
+    # Perform spatial join between building points and UHI buffers.
+    joined = gpd.sjoin(gdf_buildings, df_uhi[['buffer']], how='inner', predicate='intersects')
+    
+    # Aggregate the socio-economic features from the building level to the UHI point level.
+    agg = joined.groupby('index_right').agg(
+        mean_avg_income=('avg_income', 'mean'),
+        max_max_education=('max_education', 'max'),
+        mean_has_socioecon=('has_socioecon', 'mean'),
+        mean_income_interaction=('income_residential_interaction', 'mean'),
+        mean_log_avg_income=('log_avg_income', 'mean')
+    ).reset_index()
+    
+    # Merge the aggregated socio-economic features back into df_uhi.
+    df_uhi = df_uhi.merge(agg, left_index=True, right_on='index_right', how='left')
+    return df_uhi
+
+def feature_engineering(df_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather, df_person):
     """
     Main feature engineering function.
     
@@ -77,26 +112,44 @@ def feature_engineering(df_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather)
       - gdf_ndvi: Sentinel-2 NDVI data (GeoDataFrame)
       - gdf_albedo: Landsat Albedo data (GeoDataFrame)
       - df_weather: Weather data (DataFrame)
+      - df_person: Socio-economic data from person_puf_21.csv (DataFrame)
     
     Returns:
-      - Engineered UHI data with aggregated features
+      - Engineered UHI data with aggregated features (df_uhi)
       - Weather data (unchanged)
     """
     print("Starting feature engineering...")
+    
+    # 1. Create buffer around UHI points.
     df_uhi = create_buffer(df_uhi, 100)
+    
+    # 2. Aggregate building, NDVI, and albedo features into df_uhi.
     df_uhi = aggregate_building_features(df_uhi, gdf_buildings, 31416)
     df_uhi = aggregate_ndvi_features(df_uhi, gdf_ndvi)
     df_uhi = aggregate_albedo_features(df_uhi, gdf_albedo)
     df_uhi = integrate_weather_data(df_uhi, df_weather)
-    print("Feature engineering complete. Sample features:")
+    
+    # 3. --- Socio-Economic Data Integration ---
+    # a. Aggregate the person-level socio-economic data.
+    agg_socioecon = aggregate_socioecon_data(df_person)
+    
+    # b. Merge the aggregated socio-economic data into the building dataset.
+    #    Here, we assume that the building dataset has a 'bin' column that corresponds to the CONTROL code.
+    gdf_buildings = gdf_buildings.merge(agg_socioecon, left_on='bin', right_on='CONTROL', how='left')
+    
+    # c. Create new socio-economic features in the building dataset.
+    # Indicator: 1 if socio-economic data exists, 0 otherwise.
+    gdf_buildings['has_socioecon'] = gdf_buildings['avg_income'].notnull().astype(int)
+    
+    # Example: Define an 'is_residential' flag (replace with actual logic if available).
+    if 'is_residential' not in gdf_buildings.columns:
+        gdf_buildings['is_residential'] = 1
+    gdf_buildings['income_residential_interaction'] = gdf_buildings['avg_income'] * gdf_buildings['is_residential']
+    gdf_buildings['log_avg_income'] = np.log1p(gdf_buildings['avg_income'])
+    
+    # d. Aggregate the socio-economic features from the building dataset into df_uhi.
+    df_uhi = aggregate_socioecon_features(df_uhi, gdf_buildings)
+    
+    print("Feature engineering complete. Sample features from df_uhi:")
     print(df_uhi.head())
     return df_uhi, df_weather
-
-# Optional test block
-if __name__ == "__main__":
-    # Here you would import your previously processed data
-    # For example:
-    # from data_ingestion import read_target_variables, read_building_footprints, read_weather_data
-    # from data_processing import compute_ndvi_sentinel2, compute_landsat_lst_albedo
-    # Then call feature_engineering() with these inputs.
-    pass

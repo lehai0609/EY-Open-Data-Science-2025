@@ -111,6 +111,23 @@ def read_weather_data(filepath="input/NY_Mesonet_Weather.xlsx"):
     return df_weather
 
 # ----------------------------------------------------------------------
+# 05 Read socio economic data
+# ----------------------------------------------------------------------
+def read_person_data(filepath="input/person_puf_21.csv"):
+    """
+    Reads the socio-economic dataset (person_puf_21.csv) and returns a DataFrame
+    with selected columns:
+      - CONTROL: Housing unit identifier
+      - TOTAL_INC_REC_P: Tenant's income from all sources
+      - EDATTAIN_P: Tenant's highest education level
+    """
+    import pandas as pd
+    df_person = pd.read_csv(filepath)
+    # Keep only the columns we need
+    df_person = df_person[['CONTROL', 'TOTAL_INC_REC_P', 'EDATTAIN_P']]
+    return df_person
+
+# ----------------------------------------------------------------------
 # Optional: Test the data ingestion functions when running directly.
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
