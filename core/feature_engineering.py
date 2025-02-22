@@ -16,6 +16,7 @@ and aggregations on the input datasets from data_ingestion and data_processing:
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 
 def create_buffer(df_uhi, buffer_distance=100):
     """Adds a buffer column (geometry) around each UHI point."""
@@ -50,12 +51,12 @@ def aggregate_ndvi_features(df_uhi, gdf_ndvi):
 def aggregate_albedo_features(df_uhi, gdf_albedo):
     """Joins albedo pixels with buffered UHI and aggregates albedo statistics."""
     joined = gpd.sjoin(gdf_albedo, df_uhi.set_geometry('buffer'), how='inner', predicate='intersects')
-    agg = joined.groupby('index_right').agg(
+    agg = joined.groupby('index_right0').agg(
         mean_albedo=('Albedo', 'mean'),
         min_albedo=('Albedo', 'min'),
         max_albedo=('Albedo', 'max')
     ).reset_index()
-    df_uhi = df_uhi.merge(agg, left_on='index', right_on='index_right', how='left')
+    df_uhi = df_uhi.merge(agg, left_on='index', right_on='index_right0', how='left')
     return df_uhi
 
 def integrate_weather_data(df_uhi, df_weather):
@@ -86,11 +87,38 @@ def aggregate_socioecon_features(df_uhi, gdf_buildings):
     with df_uhi based on the UHI buffer. Aggregates socio-economic features
     (e.g., mean income, highest education) into df_uhi.
     """
-    # Perform spatial join between building points and UHI buffers.
-    joined = gpd.sjoin(gdf_buildings, df_uhi[['buffer']], how='inner', predicate='intersects')
+    import geopandas as gpd
+
+    # Reset indices to ensure they are simple sequential integers.
+    df_uhi = df_uhi.reset_index(drop=True)
+    gdf_buildings = gdf_buildings.reset_index(drop=True)
     
-    # Aggregate the socio-economic features from the building level to the UHI point level.
-    agg = joined.groupby('index_right').agg(
+    # Create a GeoDataFrame using the 'buffer' column as the active geometry.
+    uhi_buffer = gpd.GeoDataFrame(df_uhi.copy(), geometry='buffer', crs=df_uhi.crs)
+    
+    # Perform the spatial join.
+    joined = gpd.sjoin(
+        gdf_buildings,
+        uhi_buffer,
+        how='inner',
+        predicate='intersects',
+        lsuffix='_build',
+        rsuffix='_uhi'
+    )
+    
+    # Determine which column contains the right index.
+    # sjoin should create an "index_right" column, but if not, pick one that starts with it.
+    if 'index_right' in joined.columns:
+        index_col = 'index_right'
+    else:
+        possible = [col for col in joined.columns if col.startswith('index_right')]
+        if possible:
+            index_col = possible[0]
+        else:
+            raise KeyError("No column for the right index was found in the spatial join output.")
+
+    # Aggregate socio-economic features by the UHI index.
+    agg = joined.groupby(index_col).agg(
         mean_avg_income=('avg_income', 'mean'),
         max_max_education=('max_education', 'max'),
         mean_has_socioecon=('has_socioecon', 'mean'),
@@ -98,9 +126,10 @@ def aggregate_socioecon_features(df_uhi, gdf_buildings):
         mean_log_avg_income=('log_avg_income', 'mean')
     ).reset_index()
     
-    # Merge the aggregated socio-economic features back into df_uhi.
-    df_uhi = df_uhi.merge(agg, left_index=True, right_on='index_right', how='left')
+    # Merge the aggregated features back into df_uhi.
+    df_uhi = df_uhi.merge(agg, left_index=True, right_on=index_col, how='left')
     return df_uhi
+
 
 def feature_engineering(df_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather, df_person):
     """
@@ -135,6 +164,9 @@ def feature_engineering(df_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather,
     
     # b. Merge the aggregated socio-economic data into the building dataset.
     #    Here, we assume that the building dataset has a 'bin' column that corresponds to the CONTROL code.
+    # Convert the 'bin' column to numeric to match the type of 'CONTROL'
+    gdf_buildings['bin'] = pd.to_numeric(gdf_buildings['bin'], errors='coerce')
+    agg_socioecon['CONTROL'] = pd.to_numeric(agg_socioecon['CONTROL'], errors='coerce')
     gdf_buildings = gdf_buildings.merge(agg_socioecon, left_on='bin', right_on='CONTROL', how='left')
     
     # c. Create new socio-economic features in the building dataset.
