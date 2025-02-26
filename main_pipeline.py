@@ -20,7 +20,7 @@ from core.data_ingestion import (
     read_building_footprints,
     read_energy_star_data,
     read_weather_data,
-    read_person_data  # NEW: Import socio-economic data reader
+    read_social_vulnerability_index
 )
 from core.data_processing import (
     compute_ndvi_sentinel2,
@@ -36,7 +36,7 @@ def main():
     gdf_buildings = read_building_footprints()    # Building footprints
     df_energy_star = read_energy_star_data()      # ENERGY STAR scores
     df_weather = read_weather_data()              # Weather data
-    df_person = read_person_data()                # Socio-economic data (person_puf_21.csv)
+    gdf_svi = read_social_vulnerability_index()   # Social Vulnerability Index data
 
     # Merge ENERGY STAR scores into building footprints (assumes common key 'bin')
     print("Merging ENERGY STAR scores into building footprints...")
@@ -51,7 +51,7 @@ def main():
     print("Starting Feature Engineering Stage...")
     # Pass df_person along with other datasets for integrated feature engineering.
     df_engineered, df_weather_processed = feature_engineering(
-        gdf_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather, df_person
+        gdf_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather, gdf_svi
     )
     
     # --- Modeling ---
