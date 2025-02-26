@@ -23,7 +23,7 @@ import geopandas as gpd
 # ----------------------------------------------------------------------
 # 01 Read Target Variables
 # ----------------------------------------------------------------------
-def read_target_variables(filepath="input/Training_data_uhi_index.csv"):
+def read_target_variables(filepath="input/Training_data_uhi_index_2025-02-18.csv"):
     """
     Reads the UHI target variables from a CSV file,
     converts the datetime column, creates a GeoDataFrame, and reprojects it to EPSG:2263.
