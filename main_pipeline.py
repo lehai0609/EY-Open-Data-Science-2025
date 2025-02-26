@@ -51,7 +51,7 @@ def main():
     print("Starting Feature Engineering Stage...")
     # Pass df_person along with other datasets for integrated feature engineering.
     df_engineered, df_weather_processed = feature_engineering(
-        gdf_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather, gdf_svi
+        gdf_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather, gdf_svi, gdf_lst
     )
     
     # --- Modeling ---
