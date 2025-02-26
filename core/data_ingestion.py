@@ -111,21 +111,51 @@ def read_weather_data(filepath="input/NY_Mesonet_Weather.xlsx"):
     return df_weather
 
 # ----------------------------------------------------------------------
-# 05 Read socio economic data
+# 05 Read socio vulnerability index data
 # ----------------------------------------------------------------------
-def read_person_data(filepath="input/person_puf_21.csv"):
+def read_social_vulnerability_index(filepath="input/SVI2022_NEWYORK_tract.gdb"):
     """
-    Reads the socio-economic dataset (person_puf_21.csv) and returns a DataFrame
-    with selected columns:
-      - CONTROL: Housing unit identifier
-      - TOTAL_INC_REC_P: Tenant's income from all sources
-      - EDATTAIN_P: Tenant's highest education level
+    Reads the Social Vulnerability Index (SVI) data from a geodatabase file.
+    The CDC/ATSDR SVI identifies communities that may need support before, during, or after
+    disasters based on 16 social factors, including socioeconomic status, household composition,
+    disability, language, etc.
+    
+    Returns:
+        gdf_svi: GeoDataFrame with SVI data for New York County
     """
-    import pandas as pd
-    df_person = pd.read_csv(filepath)
-    # Keep only the columns we need
-    df_person = df_person[['CONTROL', 'TOTAL_INC_REC_P', 'EDATTAIN_P']]
-    return df_person
+    print("Reading Social Vulnerability Index (SVI) data from:", filepath)
+    
+    # Read the GDB file - the layer name might need adjustment based on the actual file
+    gdf_svi = gpd.read_file(filepath)
+    
+    # Keep only the useful columns for our analysis - these might need adjustment
+    # based on the actual SVI data structure
+    useful_columns = [
+        'GEOID', 'geometry',  # Identification and geometry
+        'RPL_THEME1', 'RPL_THEME2', 'RPL_THEME3', 'RPL_THEME4', 'RPL_THEMES',  # Overall themes
+        'RPL_POVTY', 'RPL_UNEMP', 'RPL_PCI', 'RPL_NOHSDP',  # Socioeconomic theme
+        'RPL_AGE65', 'RPL_AGE17', 'RPL_DISABL', 'RPL_SNGPNT',  # Household composition theme
+        'RPL_MINRTY', 'RPL_LIMENG',  # Minority status/Language theme
+        'RPL_MUNIT', 'RPL_MOBILE', 'RPL_CROWD', 'RPL_NOVEH', 'RPL_GROUPQ'  # Housing/Transportation theme
+    ]
+    
+    # Filter columns if they exist in the dataset
+    available_columns = [col for col in useful_columns if col in gdf_svi.columns]
+    if set(available_columns) != set(useful_columns):
+        missing = set(useful_columns) - set(available_columns)
+        print(f"Warning: Some expected SVI columns not found: {missing}")
+    
+    gdf_svi = gdf_svi[available_columns]
+    
+    # Ensure proper projection to EPSG:2263 to match other data
+    if gdf_svi.crs is not None and gdf_svi.crs != "EPSG:2263":
+        gdf_svi = gdf_svi.to_crs("EPSG:2263")
+    elif gdf_svi.crs is None:
+        print("Warning: SVI data has no CRS information. Assuming EPSG:4326 (WGS84).")
+        gdf_svi.crs = "EPSG:4326"
+        gdf_svi = gdf_svi.to_crs("EPSG:2263")
+    
+    return gdf_svi
 
 # ----------------------------------------------------------------------
 # Optional: Test the data ingestion functions when running directly.
