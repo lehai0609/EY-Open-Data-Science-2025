@@ -19,6 +19,7 @@ Parameters (for both functions) include:
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import warnings
 import xarray as xr
 import pystac_client
@@ -30,7 +31,8 @@ def compute_ndvi_sentinel2(bbox=(-74.01, 40.75, -73.86, 40.88),
                            target_date="2021-07-24",
                            resolution=10):
     """
-    Queries Sentinel-2 data via STAC, computes NDVI, and returns a GeoDataFrame.
+    Queries Sentinel-2 data via STAC, computes NDVI and additional vegetation metrics,
+    and returns a GeoDataFrame.
     
     Parameters:
       bbox: tuple, bounding box in the order (min_lon, min_lat, max_lon, max_lat)
@@ -39,9 +41,9 @@ def compute_ndvi_sentinel2(bbox=(-74.01, 40.75, -73.86, 40.88),
       resolution: int, spatial resolution in meters
       
     Returns:
-      GeoDataFrame with NDVI values and associated geometry.
+      GeoDataFrame with NDVI values, enhanced vegetation metrics, and associated geometry.
     """
-    print("Computing NDVI from Sentinel-2 data...")
+    print("Computing NDVI and vegetation metrics from Sentinel-2 data...")
     warnings.filterwarnings('ignore')
     
     # Open STAC client and search for Sentinel-2 data
@@ -68,26 +70,56 @@ def compute_ndvi_sentinel2(bbox=(-74.01, 40.75, -73.86, 40.88),
     )
     
     # Compute NDVI using bands B08 (NIR) and B04 (red)
-    valid_mask = (data.SCL == 4) | (data.SCL == 5)
+    valid_mask = (data.SCL == 4) | (data.SCL == 5)  # Valid pixels (vegetation, bare soil)
     ndvi = (data.B08 - data.B04) / (data.B08 + data.B04 + 1e-6)
     ndvi = ndvi.where(valid_mask, other=np.nan)
+    
+    # NEW: Compute Enhanced Vegetation Index (EVI)
+    # EVI = G * ((NIR - RED) / (NIR + C1 * RED - C2 * BLUE + L))
+    # Where G=2.5, C1=6, C2=7.5, L=1
+    G = 2.5
+    C1 = 6.0
+    C2 = 7.5
+    L = 1.0
+    evi = G * ((data.B08 - data.B04) / (data.B08 + C1 * data.B04 - C2 * data.B02 + L + 1e-6))
+    evi = evi.where(valid_mask, other=np.nan)
+    
+    # NEW: Compute NDWI (Normalized Difference Water Index) using Green and NIR bands
+    ndwi = (data.B03 - data.B08) / (data.B03 + data.B08 + 1e-6)
+    ndwi = ndwi.where(valid_mask, other=np.nan)
+    
+    # Compute all indices
     ndvi = ndvi.compute()
+    evi = evi.compute()
+    ndwi = ndwi.compute()
     
     # Select scene closest to the target_date
     target_dt = np.datetime64(target_date)
     time_diffs = abs(data.time - target_dt)
     closest_time_index = int(time_diffs.argmin())
-    ndvi_slice = ndvi.isel(time=closest_time_index)
     
-    # Convert to DataFrame and then to GeoDataFrame
+    ndvi_slice = ndvi.isel(time=closest_time_index)
+    evi_slice = evi.isel(time=closest_time_index)
+    ndwi_slice = ndwi.isel(time=closest_time_index)
+    
+    # Convert to DataFrame
     ndvi_df = ndvi_slice.to_dataframe(name='NDVI').reset_index()
+    ndvi_df['EVI'] = evi_slice.to_dataframe(name='EVI').reset_index()['EVI']
+    ndvi_df['NDWI'] = ndwi_slice.to_dataframe(name='NDWI').reset_index()['NDWI']
+    
+    # NEW: Create vegetation class categories
+    ndvi_df['veg_class'] = pd.cut(ndvi_df['NDVI'], 
+                                 bins=[-1, 0.2, 0.4, 0.6, 1], 
+                                 labels=['No Vegetation', 'Low Vegetation', 'Moderate Vegetation', 'High Vegetation'])
+    
+    # Create GeoDataFrame
     gdf_ndvi = gpd.GeoDataFrame(
         ndvi_df,
         geometry=gpd.points_from_xy(ndvi_df.x, ndvi_df.y),
         crs="EPSG:2263"
     )
     
-    print("NDVI computation complete.")
+    print("NDVI and vegetation metrics computation complete.")
     return gdf_ndvi
 
 def compute_landsat_lst_albedo(bbox=(-74.01, 40.75, -73.86, 40.88),
