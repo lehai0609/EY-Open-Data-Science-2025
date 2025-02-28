@@ -1,238 +1,411 @@
 '''
-Contains functions that transform or process that data
+Contains functions for creating new features (spatial joins, aggregations, etc.).
 '''
 #!/usr/bin/env python3
 """
-data_processing.py
+feature_engineering.py
 
-This module performs the heavy-lifting of processing raw remote sensing data.
-It includes:
-  - compute_ndvi_sentinel2: Querying Sentinel-2 data via STAC and computing NDVI.
-  - compute_landsat_lst_albedo: Querying Landsat data via STAC and computing LST and broadband albedo.
-
-Parameters (for both functions) include:
-  - bbox: Bounding box (min_lon, min_lat, max_lon, max_lat)
-  - time_window: ISO time range (e.g., "YYYY-MM-DD/YYYY-MM-DD")
-  - target_date: Date string to select the scene closest to the target date
-  - resolution: Spatial resolution in meters
+This module prepares the engineered feature dataset by performing spatial joins
+and aggregations on the input datasets from data_ingestion and data_processing:
+  - UHI target data (df_uhi)
+  - Building footprints (gdf_buildings)
+  - Sentinel-2 NDVI (gdf_ndvi)
+  - Landsat Albedo (gdf_albedo)
+  - Weather data (df_weather)
 """
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import warnings
-import xarray as xr
-import pystac_client
-import planetary_computer
-from odc.stac import stac_load
 
-def compute_ndvi_sentinel2(bbox=(-74.01, 40.75, -73.86, 40.88),
-                           time_window="2021-07-01/2021-08-01",
-                           target_date="2021-07-24",
-                           resolution=10):
+def create_buffer(df_uhi, buffer_distance=100):
+    """Adds a buffer column (geometry) around each UHI point."""
+    df = df_uhi.copy()
+    df['buffer'] = df.geometry.buffer(buffer_distance)
+    return df
+
+def aggregate_building_features(df_uhi, gdf_buildings, buffer_area=31416):
     """
-    Queries Sentinel-2 data via STAC, computes NDVI and additional vegetation metrics,
-    and returns a GeoDataFrame.
+    Performs a spatial join with building footprints and aggregates building attributes.
+    Computes advanced metrics including Floor Area Ratio (FAR), Sky View Factor (SVF) 
+    approximation, and building density indicators.
     
     Parameters:
-      bbox: tuple, bounding box in the order (min_lon, min_lat, max_lon, max_lat)
-      time_window: str, time range (e.g., "YYYY-MM-DD/YYYY-MM-DD")
-      target_date: str, target date to select the closest scene (e.g., "YYYY-MM-DD")
-      resolution: int, spatial resolution in meters
-      
+        df_uhi: GeoDataFrame with UHI measurement points and buffers
+        gdf_buildings: GeoDataFrame with building footprints and attributes
+        buffer_area: Area of the buffer in square meters (default: 31416 sq m = 100m radius circle)
+        
     Returns:
-      GeoDataFrame with NDVI values, enhanced vegetation metrics, and associated geometry.
+        df_uhi: GeoDataFrame with building-related features added
     """
-    print("Computing NDVI and vegetation metrics from Sentinel-2 data...")
-    warnings.filterwarnings('ignore')
+    print("Aggregating building density and urban geometry features...")
     
-    # Open STAC client and search for Sentinel-2 data
-    stac = pystac_client.Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
-    search = stac.search(
-        bbox=bbox,
-        datetime=time_window,
-        collections=["sentinel-2-l2a"],
-        query={"eo:cloud_cover": {"lt": 30}},
-    )
-    items = list(search.get_items())
-    print("Number of Sentinel-2 scenes found:", len(items))
+    # Perform spatial join to find buildings that intersect with each buffer
+    joined = gpd.sjoin(gdf_buildings, df_uhi.set_geometry('buffer'), how='inner', predicate='intersects')
     
-    # Load data using stac_load function
-    data = stac_load(
-        items,
-        bands=["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"],
-        crs="EPSG:2263",
-        resolution=resolution,
-        chunks={"x": 2048, "y": 2048},
-        dtype="uint16",
-        patch_url=planetary_computer.sign,
-        bbox=bbox
-    )
+    # Calculate estimated floor count and floor area for each building
+    joined['floor_count'] = np.ceil(joined['heightroof'] / 3).clip(1)  # Minimum 1 floor
+    joined['floor_area'] = joined['calculated_area_sqm'] * joined['floor_count']
     
-    # Compute NDVI using bands B08 (NIR) and B04 (red)
-    valid_mask = (data.SCL == 4) | (data.SCL == 5)  # Valid pixels (vegetation, bare soil)
-    ndvi = (data.B08 - data.B04) / (data.B08 + data.B04 + 1e-6)
-    ndvi = ndvi.where(valid_mask, other=np.nan)
+    # Group by buffer and calculate metrics
+    agg = joined.groupby('index_right').agg(
+        # Basic metrics
+        building_count=('heightroof', 'count'),
+        mean_height=('heightroof', 'mean'),
+        total_area=('calculated_area_sqm', 'sum'),
+        mean_energy_star=('ENERGY STAR Score', 'mean'),
+        
+        # Advanced metrics
+        max_height=('heightroof', 'max'),
+        height_std=('heightroof', 'std'),
+        median_height=('heightroof', 'median'),
+        
+        # Building area statistics
+        min_building_area=('calculated_area_sqm', 'min'),
+        max_building_area=('calculated_area_sqm', 'max'),
+        median_building_area=('calculated_area_sqm', 'median'),
+        
+        # Total floor area (aggregated from individual building floor areas)
+        total_floor_area=('floor_area', 'sum')
+    ).reset_index()
     
-    # NEW: Compute Enhanced Vegetation Index (EVI)
-    # EVI = G * ((NIR - RED) / (NIR + C1 * RED - C2 * BLUE + L))
-    # Where G=2.5, C1=6, C2=7.5, L=1
-    G = 2.5
-    C1 = 6.0
-    C2 = 7.5
-    L = 1.0
-    evi = G * ((data.B08 - data.B04) / (data.B08 + C1 * data.B04 - C2 * data.B02 + L + 1e-6))
-    evi = evi.where(valid_mask, other=np.nan)
+    # Merge building metrics into UHI dataframe
+    df_uhi = df_uhi.reset_index().merge(agg, left_index=True, right_on='index_right', how='left')
     
-    # NEW: Compute NDWI (Normalized Difference Water Index) using Green and NIR bands
-    ndwi = (data.B03 - data.B08) / (data.B03 + data.B08 + 1e-6)
-    ndwi = ndwi.where(valid_mask, other=np.nan)
+    # Calculate derived metrics
     
-    # Compute all indices
-    ndvi = ndvi.compute()
-    evi = evi.compute()
-    ndwi = ndwi.compute()
+    # Floor Area Ratio (FAR) = Total floor area / buffer area
+    df_uhi['floor_area_ratio'] = df_uhi['total_floor_area'] / buffer_area
     
-    # Select scene closest to the target_date
-    target_dt = np.datetime64(target_date)
-    time_diffs = abs(data.time - target_dt)
-    closest_time_index = int(time_diffs.argmin())
+    # Building area ratio (footprint coverage) = Total building footprint area / buffer area
+    df_uhi['building_area_ratio'] = df_uhi['total_area'] / buffer_area
     
-    ndvi_slice = ndvi.isel(time=closest_time_index)
-    evi_slice = evi.isel(time=closest_time_index)
-    ndwi_slice = ndwi.isel(time=closest_time_index)
+    # Building density = Number of buildings / buffer area (in hectares)
+    df_uhi['building_density'] = df_uhi['building_count'] / (buffer_area / 10000)
     
-    # Convert to DataFrame
-    ndvi_df = ndvi_slice.to_dataframe(name='NDVI').reset_index()
-    ndvi_df['EVI'] = evi_slice.to_dataframe(name='EVI').reset_index()['EVI']
-    ndvi_df['NDWI'] = ndwi_slice.to_dataframe(name='NDWI').reset_index()['NDWI']
+    # Approximate Sky View Factor (SVF)
+    building_coverage = df_uhi['building_area_ratio'].clip(0.01, 0.99)  # Avoid division by zero
+    height_factor = df_uhi['mean_height'] / 30  # Normalize heights (assuming 30m is high)
     
-    # NEW: Create vegetation class categories
-    ndvi_df['veg_class'] = pd.cut(ndvi_df['NDVI'], 
-                                 bins=[-1, 0.2, 0.4, 0.6, 1], 
-                                 labels=['No Vegetation', 'Low Vegetation', 'Moderate Vegetation', 'High Vegetation'])
+    df_uhi['approx_svf'] = 1 - (height_factor * np.sqrt(building_coverage))
+    df_uhi['approx_svf'] = df_uhi['approx_svf'].clip(0.1, 1.0)  # Realistic bounds
     
-    # Create GeoDataFrame
-    gdf_ndvi = gpd.GeoDataFrame(
-        ndvi_df,
-        geometry=gpd.points_from_xy(ndvi_df.x, ndvi_df.y),
-        crs="EPSG:2263"
+    # Urban canyon metric (H/W ratio - height to width ratio)
+    avg_spacing = np.sqrt((buffer_area * (1 - building_coverage)) / df_uhi['building_count'].clip(1))
+    df_uhi['canyon_effect'] = (df_uhi['mean_height'] / avg_spacing.clip(1)).clip(0, 5)
+    
+    # Height-to-area ratio (vertical density)
+    df_uhi['height_to_area_ratio'] = df_uhi['mean_height'] / df_uhi['total_area'].clip(1)
+    
+    # Building regularity (std of height / mean height)
+    df_uhi['building_height_regularity'] = (df_uhi['height_std'] / df_uhi['mean_height'].clip(1)).clip(0, 5)
+    
+    # Create composite urban geometry score (higher = more heat-trapping urban form)
+    df_uhi['urban_geometry_score'] = (
+        0.3 * (1 - df_uhi['approx_svf']) +  # Lower SVF increases score
+        0.3 * df_uhi['building_area_ratio'] +  # Higher coverage increases score
+        0.2 * (df_uhi['canyon_effect'] / 5) +  # Higher canyon effect increases score
+        0.2 * (df_uhi['mean_height'] / 100)    # Higher buildings increase score
     )
     
-    print("NDVI and vegetation metrics computation complete.")
-    return gdf_ndvi
+    # Fill NaN values for any new columns
+    for col in df_uhi.columns:
+        if col not in ['geometry', 'buffer'] and df_uhi[col].dtype in ['float64', 'int64']:
+            df_uhi[col] = df_uhi[col].fillna(0)
+    
+    return df_uhi
 
-def compute_landsat_lst_albedo(bbox=(-74.01, 40.75, -73.86, 40.88),
-                               time_window="2021-06-01/2021-09-01",
-                               target_date="2021-07-24",
-                               resolution=30):
+def aggregate_ndvi_features(df_uhi, gdf_ndvi):
     """
-    Queries Landsat data via STAC, computes Land Surface Temperature (LST) and broadband albedo,
-    and returns two GeoDataFrames.
+    Joins NDVI pixels with buffered UHI and aggregates vegetation-related statistics.
+    Incorporates enhanced vegetation metrics for better quantification of cooling effects.
+    """
+    print("Aggregating vegetation features from NDVI, EVI, and NDWI data...")
+    
+    # Perform spatial join
+    joined = gpd.sjoin(gdf_ndvi, df_uhi.set_geometry('buffer'), how='inner', predicate='intersects')
+    
+    # Aggregate vegetation metrics
+    agg = joined.groupby('index_right').agg(
+        # Basic NDVI statistics
+        mean_ndvi=('NDVI', 'mean'),
+        median_ndvi=('NDVI', 'median'),
+        std_ndvi=('NDVI', 'std'),
+        min_ndvi=('NDVI', 'min'),
+        max_ndvi=('NDVI', 'max'),
+        
+        # Enhanced Vegetation Index (EVI) statistics
+        mean_evi=('EVI', 'mean'),
+        median_evi=('EVI', 'median'),
+        
+        # Water presence (NDWI) statistics
+        mean_ndwi=('NDWI', 'mean')
+    ).reset_index()
+    # Calculate vegetation class percentages separately
+    veg_pct = joined.groupby('index_right').apply(
+        lambda x: pd.Series({
+            'pct_no_veg': (x['veg_class'] == 'No Vegetation').mean() * 100,
+            'pct_low_veg': (x['veg_class'] == 'Low Vegetation').mean() * 100,
+            'pct_mod_veg': (x['veg_class'] == 'Moderate Vegetation').mean() * 100,
+            'pct_high_veg': (x['veg_class'] == 'High Vegetation').mean() * 100
+        })
+    ).reset_index()
+    # Merge the vegetation percentages with the other aggregated metrics
+    agg = agg.merge(veg_pct, on='index_right', how='left')
+    
+    # NEW: Create feature for sparse vegetation indicator (NDVI < 0.3)
+    agg['sparse_veg_area'] = agg['pct_no_veg'] + agg['pct_low_veg']
+    
+    # NEW: Create vegetation cooling potential score
+    # This is a weighted sum where higher vegetation density and coverage contribute more
+    agg['veg_cooling_score'] = (
+        0.5 * agg['mean_ndvi'] + 
+        0.3 * agg['pct_high_veg']/100 + 
+        0.2 * agg['mean_evi']
+    )
+    
+    # Merge with UHI dataframe
+    df_uhi = df_uhi.merge(agg, left_on='index', right_on='index_right', how='left')
+    
+    return df_uhi
+
+def aggregate_albedo_features(df_uhi, gdf_albedo, gdf_lst, buffer_size=100):
+    """
+    Aggregates albedo and LST features for each UHI measurement point.
     
     Parameters:
-      bbox: tuple, bounding box in the order (min_lon, min_lat, max_lon, max_lat)
-      time_window: str, time range (e.g., "YYYY-MM-DD/YYYY-MM-DD")
-      target_date: str, target date to select the closest scene (e.g., "YYYY-MM-DD")
-      resolution: int, spatial resolution in meters
-      
+        df_uhi: GeoDataFrame of UHI measurement points
+        gdf_albedo: GeoDataFrame with albedo values
+        gdf_lst: GeoDataFrame with Land Surface Temperature (LST) values
+        buffer_size: Buffer size in meters for spatial aggregation
+        
     Returns:
-      Tuple of GeoDataFrames: (gdf_lst, gdf_albedo)
+        DataFrame with UHI points and aggregated albedo and LST features
     """
-    print("Computing LST and Albedo from Landsat data...")
-    warnings.filterwarnings('ignore')
+    print("Aggregating albedo and LST features...")
     
-    stac = pystac_client.Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
-    search = stac.search(
-        bbox=bbox,
-        datetime=time_window,
-        collections=["landsat-c2-l2"],
-        query={"eo:cloud_cover": {"lt": 50}, "platform": {"in": ["landsat-8"]}},
+    # Create a copy of the UHI dataframe with reset index to ensure proper joining
+    df_uhi_reset = df_uhi.copy().reset_index()
+    
+    # Create buffers around UHI points for spatial aggregation
+    df_uhi_reset['buffer'] = df_uhi_reset.geometry.buffer(buffer_size)
+    
+    # Create a spatial index on the albedo dataframe to speed up the join
+    gdf_albedo_reset = gdf_albedo.copy().reset_index()
+    
+    # Perform spatial join between UHI buffers and albedo points
+    joined_albedo = gpd.sjoin(gdf_albedo_reset, 
+                             gpd.GeoDataFrame(df_uhi_reset[['buffer']], 
+                                             geometry='buffer', 
+                                             crs=df_uhi_reset.crs),
+                             predicate='within')
+    
+    # Debug: Print column names to verify
+    print("Columns after albedo join:", joined_albedo.columns.tolist())
+    
+    # Find the correct join index column - it could be 'index_right' or 'index'
+    # depending on how the join was performed
+    join_index_col = None
+    for col_name in ['index_right', 'index']:
+        if col_name in joined_albedo.columns:
+            join_index_col = col_name
+            break
+    
+    if join_index_col is None:
+        raise ValueError("Could not find a suitable join index column. "
+                        f"Available columns: {joined_albedo.columns.tolist()}")
+    
+    # Group by the join index column and calculate aggregate statistics
+    agg_albedo = joined_albedo.groupby(join_index_col).agg(
+        mean_albedo=('Albedo', 'mean'),
+        min_albedo=('Albedo', 'min'),
+        max_albedo=('Albedo', 'max'),
+        std_albedo=('Albedo', 'std')
+    ).reset_index()
+    
+    # Reset index on LST dataframe
+    gdf_lst_reset = gdf_lst.copy().reset_index()
+    
+    # Perform spatial join between UHI buffers and LST points
+    joined_lst = gpd.sjoin(gdf_lst_reset,
+                          gpd.GeoDataFrame(df_uhi_reset[['buffer']], 
+                                          geometry='buffer', 
+                                          crs=df_uhi_reset.crs),
+                          predicate='within')
+    
+    # Debug: Print column names to verify
+    print("Columns after LST join:", joined_lst.columns.tolist())
+    
+    # Find the correct join index column for LST
+    join_index_col_lst = None
+    for col_name in ['index_right', 'index']:
+        if col_name in joined_lst.columns:
+            join_index_col_lst = col_name
+            break
+    
+    if join_index_col_lst is None:
+        raise ValueError("Could not find a suitable join index column for LST. "
+                        f"Available columns: {joined_lst.columns.tolist()}")
+    
+    # Group by the join index column and calculate aggregate statistics
+    agg_lst = joined_lst.groupby(join_index_col_lst).agg(
+        mean_lst=('LST', 'mean'),
+        min_lst=('LST', 'min'),
+        max_lst=('LST', 'max'),
+        std_lst=('LST', 'std')
+    ).reset_index()
+    
+    # Merge albedo features back to UHI points
+    df_result = df_uhi_reset.merge(
+        agg_albedo, 
+        left_on='index', 
+        right_on=join_index_col, 
+        how='left',
+        suffixes=('', '_albedo')
     )
-    items = list(search.get_items())
-    print("Number of Landsat scenes found:", len(items))
     
-    # Load optical bands for albedo computation
-    data1 = stac_load(
-        items,
-        bands=["blue", "red", "nir08", "swir16", "swir22"],
-        crs="EPSG:2263",
-        resolution=resolution,
-        chunks={"x": 2048, "y": 2048},
-        dtype="uint16",
-        patch_url=planetary_computer.sign,
-        bbox=bbox
-    )
-    # Load thermal band for LST computation
-    data2 = stac_load(
-        items,
-        bands=["lwir11"],
-        crs="EPSG:2263",
-        resolution=resolution,
-        chunks={"x": 2048, "y": 2048},
-        dtype="uint16",
-        patch_url=planetary_computer.sign,
-        bbox=bbox
+    # Drop join index column from albedo if it's not 'index'
+    if join_index_col != 'index' and join_index_col in df_result.columns:
+        df_result.drop(columns=[join_index_col], inplace=True, errors='ignore')
+    
+    # Merge LST features
+    df_result = df_result.merge(
+        agg_lst, 
+        left_on='index', 
+        right_on=join_index_col_lst, 
+        how='left',
+        suffixes=('', '_lst')
     )
     
-    # Process optical bands: scale and compute broadband albedo
-    scale1 = 0.0000275
-    offset1 = -0.2
-    data1 = data1.astype(float) * scale1 + offset1
-    albedo = (0.356 * data1["blue"] +
-              0.130 * data1["red"] +
-              0.373 * data1["nir08"] +
-              0.085 * data1["swir16"] +
-              0.072 * data1["swir22"] - 0.018)
+    # Drop unnecessary columns
+    df_result.drop(columns=['buffer'], inplace=True, errors='ignore')
+    if join_index_col_lst != 'index' and join_index_col_lst in df_result.columns:
+        df_result.drop(columns=[join_index_col_lst], inplace=True, errors='ignore')
     
-    # Process thermal band: scale and compute LST
-    scale2 = 0.00341802
-    offset2 = 149.0
-    kelvin_celsius = 273.15
-    data2 = data2.astype(float) * scale2 + offset2 - kelvin_celsius
+    # Clean up any potential duplicated index columns
+    for col in df_result.columns:
+        if col.startswith('index_right') or (col.startswith('index_') and col != 'index'):
+            df_result.drop(columns=[col], inplace=True, errors='ignore')
     
-    # Select scene closest to the target_date
-    target_dt = np.datetime64(target_date)
-    time_diffs = abs(data2.time - target_dt)
-    closest_time_index = int(time_diffs.argmin())
-    lst_slice = data2.isel(time=closest_time_index)
-    albedo_slice = albedo.isel(time=closest_time_index)
-    
-    # Convert LST slice to a GeoDataFrame
-    lst_df = lst_slice.to_dataframe().reset_index().rename(columns={'lwir11': 'LST'})
-    gdf_lst = gpd.GeoDataFrame(
-        lst_df,
-        geometry=gpd.points_from_xy(lst_df.x, lst_df.y),
-        crs="EPSG:2263"
+    print("Albedo and LST feature aggregation complete.")
+    return df_result
+
+def integrate_weather_data(df_uhi, df_weather):
+    """Matches each UHI record to the closest weather timestamp and merges weather data."""
+    df = df_uhi.copy()
+    df['weather_time'] = df['datetime'].apply(
+        lambda x: df_weather.iloc[(df_weather['Date__Time'] - x).abs().argsort()[0]]['Date__Time']
     )
-    gdf_lst = gdf_lst[['LST', 'geometry']]
+    df = df.merge(df_weather, left_on='weather_time', right_on='Date__Time', how='left')
+    return df
+
+def aggregate_svi_features(df_uhi, gdf_svi, buffer_size=250):
+    """
+    Aggregates Social Vulnerability Index features for each UHI measurement point.
     
-    # Convert albedo slice to a GeoDataFrame
-    if albedo_slice.name is None:
-        albedo_slice = albedo_slice.rename("Albedo")
-    albedo_df = albedo_slice.to_dataframe().reset_index()
-    if albedo_slice.name is None:
-        albedo_df = albedo_df.rename(columns={0: 'Albedo'})
+    Parameters:
+        df_uhi: GeoDataFrame of UHI measurement points
+        gdf_svi: GeoDataFrame with Social Vulnerability Index data
+        buffer_size: Buffer size in meters for spatial aggregation
+        
+    Returns:
+        DataFrame with UHI points and aggregated SVI features
+    """
+    print("Aggregating Social Vulnerability Index features...")
+    
+    # Create a copy of the UHI dataframe
+    df_uhi_copy = df_uhi.copy()
+    
+    # Handle potential index column conflicts
+    if 'level_0' in df_uhi_copy.columns:
+        # Rename the existing level_0 column to avoid conflicts
+        df_uhi_copy = df_uhi_copy.rename(columns={'level_0': 'original_level_0'})
+    
+    # Create a new index column instead of using reset_index
+    df_uhi_reset = df_uhi_copy.copy()
+    df_uhi_reset['temp_join_id'] = range(len(df_uhi_reset))
+    
+    # Create buffer geometries around UHI points for spatial join
+    buffer_geometries = df_uhi_reset.geometry.buffer(buffer_size)
+    
+    # Create a GeoDataFrame with buffer geometries
+    uhi_buffer = gpd.GeoDataFrame(
+        df_uhi_reset,
+        geometry=buffer_geometries,
+        crs=df_uhi_reset.crs
+    )
+    
+    # Perform spatial join between UHI buffers and SVI polygons
+    joined = gpd.sjoin(uhi_buffer, gdf_svi, how='left', predicate='intersects')
+    
+    # Print columns for debugging
+    print("Columns after SVI join:", joined.columns.tolist())
+    
+    # Identify SVI feature columns (excluding geometry and metadata columns)
+    svi_columns = [col for col in gdf_svi.columns 
+                  if col.startswith('RPL_') and col in joined.columns]
+    
+    print(f"Found {len(svi_columns)} SVI feature columns to aggregate")
+    
+    if not svi_columns:
+        print("Warning: No SVI feature columns found for aggregation")
+        return df_uhi_reset
+    
+    # Group by the original UHI index and calculate statistics for each SVI metric
+    result = df_uhi_reset.copy()
+    
+    # Perform groupby and aggregation
+    if len(joined) > 0:
+        agg_dict = {col: ['mean', 'median'] for col in svi_columns}
+        agg_svi = joined.groupby('temp_join_id').agg(agg_dict)
+        
+        # Flatten MultiIndex columns
+        agg_svi.columns = ['_'.join(col).strip() for col in agg_svi.columns.values]
+        agg_svi = agg_svi.reset_index()
+        
+        # Merge back to original UHI points
+        result = df_uhi_reset.merge(agg_svi, on='temp_join_id', how='left')
     else:
-        albedo_df = albedo_df.rename(columns={albedo_slice.name: 'Albedo'})
-    gdf_albedo = gpd.GeoDataFrame(
-        albedo_df,
-        geometry=gpd.points_from_xy(albedo_df.x, albedo_df.y),
-        crs="EPSG:2263"
-    )
-    gdf_albedo = gdf_albedo[['Albedo', 'geometry']]
+        print("Warning: No matching SVI features found after spatial join")
     
-    print("LST and Albedo computation complete.")
-    return gdf_lst, gdf_albedo
+    # Clean up temporary join column
+    if 'temp_join_id' in result.columns:
+        result.drop(columns=['temp_join_id'], inplace=True)
+    
+    print("SVI feature aggregation complete.")
+    return result
 
-# Optional testing when running this module directly
-if __name__ == "__main__":
-    ndvi_gdf = compute_ndvi_sentinel2()
-    print("Sentinel-2 NDVI sample:")
-    print(ndvi_gdf.head())
+def feature_engineering(df_uhi, gdf_buildings, gdf_ndvi, gdf_albedo, df_weather, gdf_svi, gdf_lst):
+    """
+    Main feature engineering function.
     
-    lst_gdf, albedo_gdf = compute_landsat_lst_albedo()
-    print("Landsat LST sample:")
-    print(lst_gdf.head())
-    print("Landsat Albedo sample:")
-    print(albedo_gdf.head())
+    Inputs:
+      - df_uhi: UHI target data (GeoDataFrame)
+      - gdf_buildings: Building footprints (GeoDataFrame)
+      - gdf_ndvi: Sentinel-2 NDVI data (GeoDataFrame)
+      - gdf_albedo: Landsat Albedo data (GeoDataFrame)
+      - df_weather: Weather data (DataFrame)
+      - gdf_svi: Social Vulnerability Index data (GeoDataFrame)
+      - gdf_lst: Landsat Land Surface Temperature data (GeoDataFrame)
+    
+    Returns:
+      - Engineered UHI data with aggregated features (df_uhi)
+      - Weather data (unchanged)
+    """
+    print("Starting feature engineering...")
+    
+    # 1. Create buffer around UHI points.
+    df_uhi = create_buffer(df_uhi, 100)
+    
+    # 2. Aggregate building, NDVI, and albedo features into df_uhi.
+    df_uhi = aggregate_building_features(df_uhi, gdf_buildings, 31416)
+    df_uhi = aggregate_ndvi_features(df_uhi, gdf_ndvi)
+    df_uhi = aggregate_albedo_features(df_uhi, gdf_albedo, gdf_lst)
+    df_uhi = integrate_weather_data(df_uhi, df_weather)
+    
+    # 3. Integrate SVI data
+    df_uhi = aggregate_svi_features(df_uhi, gdf_svi)
+    
+    print("Feature engineering complete. Sample features from df_uhi:")
+    print(df_uhi.head())
+    return df_uhi, df_weather
